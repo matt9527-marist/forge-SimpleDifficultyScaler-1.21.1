@@ -73,7 +73,7 @@ Difficulty Tiers 1-6
 + chances to spawn ravagers increased
 + All Vindicators spawn with Johnny tag and Sharpness 5 Axe
 + Ravagers can spawn with Evokers riding them
-+ all mobs that can spawn with gear must spawn with a full set of armor ranging from iron to Netherite
++ all mobs that can spawn with gear must spawn with a full set of armor ranging from diamond to Netherite
 + chances for enchanted mobs to spawn with enchantment power 30
   + Specific chance for mobs to spawn with Sharpness 5 Knockback 2 Fire Aspect 2 Netherite Sword
   + Specific chance for Skeleton mobs to spawn with Power 5 Punch 2 Flame 1 Bow
