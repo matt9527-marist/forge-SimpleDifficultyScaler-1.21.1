@@ -77,7 +77,7 @@ Difficulty Tiers 1-6
 + chances for enchanted mobs to spawn with enchantment power 30
   + Specific chance for mobs to spawn with Sharpness 5 Knockback 2 Fire Aspect 2 Netherite Sword
   + Specific chance for Skeleton mobs to spawn with Power 5 Punch 2 Flame 1 Bow
-  + All Pillagers will spawn with Quick Charge 6 Multishot Crossbows
+  + All Pillagers will spawn with Multishot Crossbows
   + Strays and Bogged Skeletons can be given a tipped arrow of harming II.
 + all mobs that can spawn with a weapon are guaranteed to spawn with a weapon ranging from diamond to Netherite
 + chances for mobs to spawn with potion effects up to level 5
