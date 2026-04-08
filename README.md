@@ -56,6 +56,8 @@ Difficulty Tiers 1-6
   + specific chance for Skeleton mobs to spawn with Flame Bow.
   + specific chance for Skeleton mobs to spawn with Power 5 Bow.
 + Mobs that can spawn with gear are now guaranteed to spawn with at least one piece of gear.
++ Size of naturally spawning Slimes
++ Mobs can now spawn in the daytime, if so, guaranteed to have at most a leather helmet.
 
 ### Inferno
 + chances to spawn Skeleton Knight
@@ -66,6 +68,8 @@ Difficulty Tiers 1-6
 + chances to spawn Breezes
 + chances for Strays, Husks, and Bogged to spawn in place of Skeletons
 + Creepers can now naturally spawn charged
++ Size of naturally spawning Slimes
++ Mobs can now spawn in the daytime, if so, guaranteed to have at most an iron helmet.
 
 ### Torment
 + chances to spawn ravagers increased
@@ -81,5 +85,6 @@ Difficulty Tiers 1-6
 + chances for mobs to spawn with oozing/infested/weaving/wind charging effects
 + Mobs can now spawn with a totem of undying in their offhand
 + Heavily increased chance for Piglin Brutes to spawn in place of Piglins in the Overworld without zombification
-  
++ Wardens can spawn naturally above ground
++ Mobs can now spawn in the daytime, if so, guaranteed to have at most a netherite helmet.
   
