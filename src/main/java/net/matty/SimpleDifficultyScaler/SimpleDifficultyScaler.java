@@ -5,8 +5,11 @@ import com.mojang.brigadier.arguments.IntegerArgumentType;
 import net.minecraft.commands.CommandSourceStack;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.Difficulty;
 import net.minecraft.world.entity.Entity;
@@ -39,9 +42,14 @@ import net.minecraft.world.entity.monster.piglin.PiglinBrute;
 import net.minecraft.world.entity.monster.breeze.Breeze;
 import net.minecraft.world.entity.animal.horse.SkeletonHorse;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.entity.projectile.Arrow;
 import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.item.TieredItem;
+import net.minecraft.world.item.Tiers;
+import net.minecraft.world.item.alchemy.Potion;
+import net.minecraft.world.item.alchemy.PotionContents;
 import net.minecraft.world.item.enchantment.EnchantmentHelper;
 import net.minecraft.world.item.enchantment.Enchantments;
 import net.minecraft.world.effect.MobEffectInstance;
@@ -49,6 +57,7 @@ import net.minecraft.world.effect.MobEffects;
 import net.minecraft.world.level.GameRules;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.ServerLevelAccessor;
+import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.saveddata.SavedData;
 import net.minecraftforge.event.entity.EntityJoinLevelEvent;
 import net.minecraftforge.event.entity.living.LivingEvent;
@@ -93,12 +102,39 @@ public class SimpleDifficultyScaler
     private static final String PENDING_NETHERITE_SWORD_TAG = MOD_ID + ":pending_netherite_sword";
     /** Hell+ (tier 4+): roll for a guaranteed Sharpness V netherite sword (applied after vanilla equips). */
     private static final String PENDING_SHARPNESS_NETHERITE_SWORD_TAG = MOD_ID + ":pending_sharpness_netherite_sword";
+    /** Torment (tier 6): netherite sword Sharp V + Fire Aspect II + Knockback II; wins over other pending sword tags. */
+    private static final String PENDING_TORMENT_GOD_SWORD_TAG = MOD_ID + ":pending_torment_god_sword";
     /** Tier 4+: roll for a Flame bow on skeletons (applied after vanilla equips). */
     private static final String PENDING_SKELETON_FLAME_BOW_TAG = MOD_ID + ":pending_skeleton_flame_bow";
     /** Tier 4+: roll for a Power V bow on skeletons (applied after vanilla equips). */
     private static final String PENDING_SKELETON_POWER5_BOW_TAG = MOD_ID + ":pending_skeleton_power5_bow";
+    /** Torment (tier 6): bow with Power V + Punch II + Flame; wins over other pending skeleton bow tags. */
+    private static final String PENDING_TORMENT_GOD_BOW_TAG = MOD_ID + ":pending_torment_god_bow";
+    /** Torment (tier 6): Pillager main-hand Multishot + Quick Charge III crossbow (EntityJoinLevel stomp). */
+    private static final String PENDING_TORMENT_PILLAGER_CROSSBOW_TAG = MOD_ID + ":pending_torment_pillager_crossbow";
+    /** Ensures Torment Pillager crossbow chance is rolled once on first world join (FinalizeSpawn can run after EntityJoinLevel for some spawns). */
+    private static final String TORMENT_PILLAGER_CROSSBOW_ROLL_DONE_TAG = MOD_ID + ":torment_pillager_crossbow_roll_done";
+    /** Torment (tier 6): {@link Stray}/{@link Bogged} shoot Strong Harming tipped arrows instead of vanilla slowness/poison tips. */
+    private static final String TORMENT_STRAY_BOGGED_HARMING_ARROWS_TAG = MOD_ID + ":torment_stray_bogged_harming_arrows";
+    /** Same ordering fix as {@link #TORMENT_PILLAGER_CROSSBOW_ROLL_DONE_TAG} for Stray/Bogged harming arrows. */
+    private static final String TORMENT_STRAY_BOGGED_HARMING_ROLL_DONE_TAG = MOD_ID + ":torment_stray_bogged_harming_roll_done";
+    /** Torment (tier 6): every {@link Vindicator} tags Johnny + Sharp V axe (applied in EntityJoinLevel LOWEST + stomp). */
+    private static final String PENDING_TORMENT_VINDICATOR_JOHNNY_TAG = MOD_ID + ":pending_torment_vindicator_johnny";
+    /** Ensures Torment Vindicator Johnny is armed once on first join / finalize (ordering vs {@link EntityJoinLevelEvent}). */
+    private static final String TORMENT_VINDICATOR_JOHNNY_ROLL_DONE_TAG = MOD_ID + ":torment_vindicator_johnny_roll_done";
+    /** Torment (tier 6): chance any mob spawns with Totem of Undying in offhand (applied in EntityJoinLevel LOWEST + stomp). */
+    private static final String PENDING_TORMENT_TOTEM_OFFHAND_TAG = MOD_ID + ":pending_torment_totem_offhand";
+    /** Ensures Torment Totem offhand chance is rolled once per mob lifetime. */
+    private static final String TORMENT_TOTEM_OFFHAND_ROLL_DONE_TAG = MOD_ID + ":torment_totem_offhand_roll_done";
+    /** Torment (tier 6): {@link #applyTierGearAndEffects} rolls this chance to force diamond–netherite melee for {@link #isVanillaGearRollingMob}. */
+    private static final float TORMENT_UPGRADED_WEAPON_GUARANTEE_CHANCE = 0.99f;
     /** Hell Skeleton Knight mount: vanilla skeleton horses do not run hostile despawn logic; we mirror {@link MobCategory#MONSTER} rules on tick. */
     private static final String SKELETON_KNIGHT_HORSE_TAG = MOD_ID + ":skeleton_knight_mount";
+    /** Vanilla Strong Harming potion (Harming II when used as a tipped arrow). */
+    private static final ResourceKey<Potion> VANILLA_STRONG_HARMING_POTION = ResourceKey.create(
+        Registries.POTION,
+        ResourceLocation.withDefaultNamespace("strong_harming")
+    );
 
     public enum Tier {
         STARTING(0, "Starting"),
@@ -158,11 +194,15 @@ public class SimpleDifficultyScaler
         float breezeReplaceChance,
         /** Tier 4+ (Hell and up): Zombies + Wither Skeletons roll to spawn with a Sharpness V netherite sword. */
         float hellSharpnessNetheriteSwordChance,
+        /** Tier 6 (Torment): Zombies + Wither Skeletons roll for a netherite sword (Sharp V, Fire Aspect II, Knockback II); overrides other sword pending tags when applied. */
+        float tormentGodSwordChance,
         /** Tier 4+: chance a Skeleton-type mob spawns with a Flame bow. */
         float skeletonFlameBowChance,
         /** Tier 4+: chance a Skeleton-type mob spawns with a Power V bow. */
         float skeletonPower5BowChance,
-        /** Tier 4 (Hell): chance a Vindicator spawns as "Johnny" with a Sharpness V axe. */
+        /** Tier 6 (Torment): Skeleton (not Wither) roll for bow Power V + Punch II + Flame; overrides flame/power5 pending bow tags when applied. */
+        float tormentGodBowChance,
+        /** Tier 4 (Hell): chance a Vindicator spawns as "Johnny" with a Sharpness V axe. Tier 6 (Torment): every Vindicator is Johnny (this field unused there). */
         float hellJohnnyVindicatorChance,
         /** Tier 5+ (Inferno and up): independent hidden/no-particle roll per spawn. */
         float infernoOozingChance,
@@ -173,7 +213,15 @@ public class SimpleDifficultyScaler
         /** Tier 5+ (Inferno and up): chance a natural Creeper spawn is upgraded to a charged Creeper. */
         float infernoChargedCreeperChance,
         /** Tier 6 (Torment): chance any spawning {@link EntityType#RAVAGER} gains an {@link EntityType#EVOKER} rider. */
-        float tormentRavagerEvokerRiderChance
+        float tormentRavagerEvokerRiderChance,
+        /** Tier 6 (Torment): chance a {@link Pillager} tags Multishot + Quick Charge III crossbow (applied in EntityJoinLevel). */
+        float tormentPillagerMultishotCrossbowChance,
+        /** Tier 6 (Torment): chance a {@link Stray} or {@link Bogged} uses Strong Harming tipped arrows (replaces vanilla tipped behavior on shot arrows). */
+        float tormentStrayBoggedHarmingArrowChance,
+        /** Tier 6 (Torment): chance any spawning {@link Mob} has a Totem of Undying in offhand. */
+        float tormentTotemOffhandChance,
+        /** Tier 6 (Torment): chance a natural Overworld hostile spawn causes an additional {@link EntityType#WARDEN} to spawn (outside Deep Dark biome). */
+        float tormentOverworldWardenChance
     ) {
     }
 
@@ -202,14 +250,20 @@ public class SimpleDifficultyScaler
                 0.0f,  // ravagerUpgradeChance
                 0.0f,  // breezeReplaceChance
                 0.0f,  // hellSharpnessNetheriteSwordChance
+                0.0f,  // tormentGodSwordChance
                 0.0f,  // skeletonFlameBowChance
                 0.0f,  // skeletonPower5BowChance
+                0.0f,  // tormentGodBowChance
                 0.0f,  // hellJohnnyVindicatorChance
                 0.0f,  // infernoOozingChance
                 0.0f,  // infernoInfestationChance
                 0.0f,  // infernoWindChargingChance
                 0.0f,  // infernoChargedCreeperChance
-                0.0f   // tormentRavagerEvokerRiderChance
+                0.0f,  // tormentRavagerEvokerRiderChance
+                0.0f,  // tormentPillagerMultishotCrossbowChance
+                0.0f,  // tormentStrayBoggedHarmingArrowChance
+                0.0f,  // tormentTotemOffhandChance
+                0.0f   // tormentOverworldWardenChance
             );
             case 2 -> new TierTuning(
                 0.05f, // pillagerUpgradeChance
@@ -233,14 +287,20 @@ public class SimpleDifficultyScaler
                 0.0015f, // ravagerUpgradeChance
                 0.0f,  // breezeReplaceChance
                 0.0f,   // hellSharpnessNetheriteSwordChance
+                0.0f,   // tormentGodSwordChance
                 0.0f,   // skeletonFlameBowChance
                 0.0f,   // skeletonPower5BowChance
+                0.0f,   // tormentGodBowChance
                 0.0f,   // hellJohnnyVindicatorChance
                 0.0f,   // infernoOozingChance
                 0.0f,   // infernoInfestationChance
                 0.0f,   // infernoWindChargingChance
                 0.0f,   // infernoChargedCreeperChance
-                0.0f    // tormentRavagerEvokerRiderChance
+                0.0f,   // tormentRavagerEvokerRiderChance
+                0.0f,   // tormentPillagerMultishotCrossbowChance
+                0.0f,   // tormentStrayBoggedHarmingArrowChance
+                0.0f,   // tormentTotemOffhandChance
+                0.0f    // tormentOverworldWardenChance
             );
             case 3 -> new TierTuning(
                 0.08f, // pillagerUpgradeChance (up from Monsoon 5%)
@@ -264,14 +324,20 @@ public class SimpleDifficultyScaler
                 0.002f, // ravagerUpgradeChance
                 0.0f, // breezeReplaceChance
                 0.0f, // hellSharpnessNetheriteSwordChance
+                0.0f, // tormentGodSwordChance
                 0.0f, // skeletonFlameBowChance
                 0.0f, // skeletonPower5BowChance
+                0.0f, // tormentGodBowChance
                 0.0f, // hellJohnnyVindicatorChance
                 0.0f, // infernoOozingChance
                 0.0f, // infernoInfestationChance
                 0.0f, // infernoWindChargingChance
                 0.0f, // infernoChargedCreeperChance
-                0.0f  // tormentRavagerEvokerRiderChance
+                0.0f, // tormentRavagerEvokerRiderChance
+                0.0f, // tormentPillagerMultishotCrossbowChance
+                0.0f, // tormentStrayBoggedHarmingArrowChance
+                0.0f, // tormentTotemOffhandChance
+                0.0f  // tormentOverworldWardenChance
             );
             case 4 -> new TierTuning(
                 0.09f, // pillagerUpgradeChance
@@ -295,14 +361,20 @@ public class SimpleDifficultyScaler
                 0.03f, // ravagerUpgradeChance
                 0.02f, // breezeReplaceChance
                 0.02f, // hellSharpnessNetheriteSwordChance
+                0.0f, // tormentGodSwordChance
                 0.5f, // skeletonFlameBowChance
                 0.03f,  // skeletonPower5BowChance
+                0.0f,  // tormentGodBowChance
                 0.08f,  // hellJohnnyVindicatorChance
                 0.0f,   // infernoOozingChance
                 0.0f,   // infernoInfestationChance
                 0.0f,   // infernoWindChargingChance
                 0.0f,   // infernoChargedCreeperChance
-                0.0f    // tormentRavagerEvokerRiderChance
+                0.0f,   // tormentRavagerEvokerRiderChance
+                0.0f,   // tormentPillagerMultishotCrossbowChance
+                0.0f,   // tormentStrayBoggedHarmingArrowChance
+                0.0f,   // tormentTotemOffhandChance
+                0.0f    // tormentOverworldWardenChance
             );
             case 5 -> new TierTuning(
                 0.10f, // pillagerUpgradeChance
@@ -326,19 +398,25 @@ public class SimpleDifficultyScaler
                 0.04f, // ravagerUpgradeChance
                 0.04f, // breezeReplaceChance
                 0.03f, // hellSharpnessNetheriteSwordChance
+                0.00f, // tormentGodSwordChance
                 0.6f,  // skeletonFlameBowChance
                 0.03f, // skeletonPower5BowChance
+                0.0f, // tormentGodBowChance
                 0.10f, // hellJohnnyVindicatorChance
                 0.11f, // infernoOozingChance
                 0.11f, // infernoInfestationChance
                 0.15f, // infernoWindChargingChance
                 0.05f, // infernoChargedCreeperChance
-                0.0f   // tormentRavagerEvokerRiderChance
+                0.0f,  // tormentRavagerEvokerRiderChance
+                0.0f,  // tormentPillagerMultishotCrossbowChance
+                0.0f,  // tormentStrayBoggedHarmingArrowChance
+                0.0003f, // tormentTotemOffhandChance
+                0.0f     // tormentOverworldWardenChance
             );
             case 6 -> new TierTuning(
                 0.12f, // pillagerUpgradeChance
                 0.10f, // vindicatorUpgradeChance
-                0.20f, // piglinBruteUpgradeChance
+                0.30f, // piglinBruteUpgradeChance
                 0.28f, // overworldVariantExtraSpawnChance
                 0.12f, // overworldNetherMobExtraSpawnChance
                 0.06f, // witchUpgradeChance
@@ -356,15 +434,21 @@ public class SimpleDifficultyScaler
                 0.06f, // spiderJockeyChance
                 0.05f, // ravagerUpgradeChance
                 0.04f, // breezeReplaceChance
-                0.04f, // hellSharpnessNetheriteSwordChance
+                0.05f, // hellSharpnessNetheriteSwordChance
+                0.02f, // tormentGodSwordChance
                 0.95f, // skeletonFlameBowChance
                 0.33f, // skeletonPower5BowChance
+                0.02f, // tormentGodBowChance
                 0.99f, // hellJohnnyVindicatorChance
                 0.20f, // infernoOozingChance
                 0.20f, // infernoInfestationChance
                 0.92f, // infernoWindChargingChance
                 0.16f, // infernoChargedCreeperChance
-                0.33f  // tormentRavagerEvokerRiderChance
+                0.33f, // tormentRavagerEvokerRiderChance
+                0.99f, // tormentPillagerMultishotCrossbowChance
+                0.35f, // tormentStrayBoggedHarmingArrowChance
+                0.03f,  // tormentTotemOffhandChance
+                0.0008f // tormentOverworldWardenChance
             );
             default -> new TierTuning(
                 0.0f,
@@ -388,14 +472,20 @@ public class SimpleDifficultyScaler
                 0.0f,  // ravagerUpgradeChance
                 0.0f,  // breezeReplaceChance
                 0.0f,  // hellSharpnessNetheriteSwordChance
+                0.0f,  // tormentGodSwordChance
                 0.0f,  // skeletonFlameBowChance
                 0.0f,  // skeletonPower5BowChance
+                0.0f,  // tormentGodBowChance
                 0.0f,  // hellJohnnyVindicatorChance
                 0.0f,  // infernoOozingChance
                 0.0f,  // infernoInfestationChance
                 0.0f,  // infernoWindChargingChance
                 0.0f,  // infernoChargedCreeperChance
-                0.0f   // tormentRavagerEvokerRiderChance
+                0.0f,  // tormentRavagerEvokerRiderChance
+                0.0f,  // tormentPillagerMultishotCrossbowChance
+                0.0f,  // tormentStrayBoggedHarmingArrowChance
+                0.0f,  // tormentTotemOffhandChance
+                0.0f   // tormentOverworldWardenChance
             );
         };
     }
@@ -634,6 +724,18 @@ public class SimpleDifficultyScaler
             maybeSpawnInfernoOverworldNetherMob(level, serverLevelAccessor, event, random, tuning, mob);
         }
 
+        // Torment (tier 6): very rare chance to spawn an additional Warden in the Overworld, outside Deep Dark biome.
+        if (tier >= 6
+            && tuning.tormentOverworldWardenChance() > 0.0f
+            && level.dimension() == Level.OVERWORLD
+            && event.getSpawnType() == MobSpawnType.NATURAL
+            && mob instanceof Monster
+            && mob.getType() != EntityType.WARDEN
+            && !isDeepDarkBiome(level, mob.blockPosition())
+            && random.nextFloat() < tuning.tormentOverworldWardenChance()) {
+            maybeSpawnTormentOverworldWarden(level, serverLevelAccessor, event, random, tuning, mob);
+        }
+
         // Nightmare+: throughout the Nether, occasionally upgrade a natural Piglin spawn to a Piglin Brute
         // (so Brutes aren't effectively "bastion-only" at high tier).
         if (tier >= 3
@@ -763,29 +865,46 @@ public class SimpleDifficultyScaler
             }
         }
 
-        // Hell (tier 4): chance for Vindicators (natural or otherwise) to become "Johnny" with a Sharpness V axe.
+        // Hell (tier 4): chance for Vindicators to become "Johnny" with a Sharpness V axe.
+        // Torment (tier 6): every Vindicator (tags pending Johnny + axe; EntityJoinLevel applies + stomps like Torment Pillagers).
         if (mob instanceof Vindicator vindicator) {
             maybeMakeHellJohnnyVindicator(vindicator, random, tuning, tier, level);
         }
+
+        // Torment Pillager crossbow + Stray/Bogged harming arrows: applied in EntityJoinLevel (HIGH) so they run before
+        // LOWEST stomp/arrow handlers — some vanilla spawn paths fire EntityJoinLevel before FinalizeSpawn, so tagging here would miss.
 
         applyTierGearAndEffects(mob, random, tuning, tier, level);
     }
 
     private static void maybeMakeHellJohnnyVindicator(Vindicator vindicator, RandomSource random, TierTuning tuning, int tier, ServerLevel level) {
-        if (tier != 4) return;
+        if (tier == Tier.TORMENT.id) {
+            if (vindicator.getPersistentData().getBoolean(TORMENT_VINDICATOR_JOHNNY_ROLL_DONE_TAG)) return;
+            vindicator.getPersistentData().putBoolean(TORMENT_VINDICATOR_JOHNNY_ROLL_DONE_TAG, true);
+            vindicator.getPersistentData().putBoolean(PENDING_TORMENT_VINDICATOR_JOHNNY_TAG, true);
+            return;
+        }
+        if (tier != Tier.HELL.id) return;
         if (tuning.hellJohnnyVindicatorChance() <= 0.0f) return;
         if (random.nextFloat() >= tuning.hellJohnnyVindicatorChance()) return;
+        equipJohnnyVindicator(vindicator, level);
+    }
+
+    private static ItemStack createJohnnySharpnessVAxe(ServerLevel level) {
+        ItemStack axe = new ItemStack(Items.IRON_AXE);
+        var enchantments = level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
+        axe.enchant(enchantments.getOrThrow(Enchantments.SHARPNESS), 5);
+        return axe;
+    }
+
+    private static void equipJohnnyVindicator(Vindicator vindicator, ServerLevel level) {
         if (!trySetVindicatorJohnnyFlag(vindicator, true)) {
             // Fallback: vanilla also recognizes the "Johnny" name; use it only if the internal flag can't be set.
             if (vindicator.hasCustomName()) return;
             vindicator.setCustomName(Component.literal("Johnny"));
             vindicator.setCustomNameVisible(false);
         }
-
-        ItemStack axe = new ItemStack(Items.IRON_AXE);
-        var enchantments = level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
-        axe.enchant(enchantments.getOrThrow(Enchantments.SHARPNESS), 5);
-        vindicator.setItemSlot(EquipmentSlot.MAINHAND, axe);
+        vindicator.setItemSlot(EquipmentSlot.MAINHAND, createJohnnySharpnessVAxe(level));
     }
 
     /**
@@ -897,6 +1016,11 @@ public class SimpleDifficultyScaler
 
         // Tier 4+ skeleton bow specials (applied later via EntityJoinLevel stomp).
         if (tier >= 4 && mob instanceof AbstractSkeleton && !(mob instanceof WitherSkeleton)) {
+            if (tier >= 6
+                && tuning.tormentGodBowChance() > 0.0f
+                && random.nextFloat() < tuning.tormentGodBowChance()) {
+                mob.getPersistentData().putBoolean(PENDING_TORMENT_GOD_BOW_TAG, true);
+            }
             if (tuning.skeletonFlameBowChance() > 0.0f && random.nextFloat() < tuning.skeletonFlameBowChance()) {
                 mob.getPersistentData().putBoolean(PENDING_SKELETON_FLAME_BOW_TAG, true);
             }
@@ -923,6 +1047,15 @@ public class SimpleDifficultyScaler
             && (mob instanceof AbstractSkeleton || mob instanceof Piglin || mob instanceof PiglinBrute)) {
             Item weapon = tier >= 3 ? pickNightmareMeleeWeapon(random) : pickMonsoonMeleeWeapon(random);
             mob.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(weapon));
+        }
+
+        // Torment (tier 6): mobs that participate in mod weapon rolls almost always get diamond–netherite melee (99%).
+        // Zombies (line): cannot keep wood–iron (or lower-tier) tools; cannot stay unarmed when this roll succeeds.
+        // Skips bow / crossbow / trident main-hand so skeletons and piglins keep their ranged role.
+        if (tier == Tier.TORMENT.id
+            && random.nextFloat() < TORMENT_UPGRADED_WEAPON_GUARANTEE_CHANCE
+            && shouldTormentReplaceOrFillMainWeapon(mob, mob.getMainHandItem())) {
+            mob.setItemSlot(EquipmentSlot.MAINHAND, new ItemStack(pickTormentDiamondNetheriteMeleeWeapon(random)));
         }
 
         // If the mob spawned with no armor, add a tier-tuned chance to equip leather→iron (Nightmare: up to diamond) armor.
@@ -1021,6 +1154,33 @@ public class SimpleDifficultyScaler
         level.addFreshEntity(extra);
     }
 
+    private static boolean isDeepDarkBiome(ServerLevel level, net.minecraft.core.BlockPos pos) {
+        return level.getBiome(pos).is(Biomes.DEEP_DARK);
+    }
+
+    private static void maybeSpawnTormentOverworldWarden(
+        ServerLevel level,
+        ServerLevelAccessor serverLevelAccessor,
+        MobSpawnEvent.FinalizeSpawn event,
+        RandomSource random,
+        TierTuning tuning,
+        Mob anchor
+    ) {
+        Mob warden = EntityType.WARDEN.create(level);
+        if (warden == null) return;
+
+        // Spawn near the anchor but not intersecting it.
+        double dx = (random.nextDouble() - 0.5D) * 8.0D;
+        double dz = (random.nextDouble() - 0.5D) * 8.0D;
+        warden.moveTo(anchor.getX() + dx, anchor.getY(), anchor.getZ() + dz, anchor.getYRot(), anchor.getXRot());
+        warden.finalizeSpawn(serverLevelAccessor, event.getDifficulty(), MobSpawnType.EVENT, null);
+
+        // Because this mob is spawned manually, Forge's FinalizeSpawn event won't run for it.
+        // Apply tier tuning explicitly so it receives Torment-level potion rolls (and join-level rolls like Totems).
+        applyTierGearAndEffects(warden, random, tuning, getCurrentTier(level), level);
+        level.addFreshEntity(warden);
+    }
+
     private static void forceImmuneToZombification(Mob mob, boolean value) {
         // Piglins + Hoglins can zombify in the Overworld unless immune.
         // Use reflection to avoid mapping differences across Forge toolchains.
@@ -1045,18 +1205,33 @@ public class SimpleDifficultyScaler
         boolean wantsDiamond = mob.getPersistentData().getBoolean(PENDING_DIAMOND_SWORD_TAG);
         boolean wantsNetherite = mob.getPersistentData().getBoolean(PENDING_NETHERITE_SWORD_TAG);
         boolean wantsSharpNetherite = mob.getPersistentData().getBoolean(PENDING_SHARPNESS_NETHERITE_SWORD_TAG);
+        boolean wantsTormentGodSword = mob.getPersistentData().getBoolean(PENDING_TORMENT_GOD_SWORD_TAG);
         boolean wantsFlameBow = mob.getPersistentData().getBoolean(PENDING_SKELETON_FLAME_BOW_TAG);
         boolean wantsPower5Bow = mob.getPersistentData().getBoolean(PENDING_SKELETON_POWER5_BOW_TAG);
-        if (!wantsDiamond && !wantsNetherite && !wantsSharpNetherite && !wantsFlameBow && !wantsPower5Bow) return;
+        boolean wantsTormentGodBow = mob.getPersistentData().getBoolean(PENDING_TORMENT_GOD_BOW_TAG);
+        if (!wantsDiamond && !wantsNetherite && !wantsSharpNetherite && !wantsTormentGodSword && !wantsFlameBow && !wantsPower5Bow && !wantsTormentGodBow) return;
         mob.getPersistentData().remove(PENDING_DIAMOND_SWORD_TAG);
         mob.getPersistentData().remove(PENDING_NETHERITE_SWORD_TAG);
         mob.getPersistentData().remove(PENDING_SHARPNESS_NETHERITE_SWORD_TAG);
+        mob.getPersistentData().remove(PENDING_TORMENT_GOD_SWORD_TAG);
         mob.getPersistentData().remove(PENDING_SKELETON_FLAME_BOW_TAG);
         mob.getPersistentData().remove(PENDING_SKELETON_POWER5_BOW_TAG);
+        mob.getPersistentData().remove(PENDING_TORMENT_GOD_BOW_TAG);
         if (getCurrentTier(level) < 2) return;
         int tier = getCurrentTier(level);
 
-        // Skeleton bow specials (tier 4+). If both hit, apply both enchantments on the same bow.
+        // Skeleton bow specials (tier 4+). Torment god bow wins over flame/power5 combinations.
+        if (tier >= 6 && wantsTormentGodBow && mob instanceof AbstractSkeleton && !(mob instanceof WitherSkeleton)) {
+            scheduleTierItemStomp(
+                mob,
+                level,
+                10,
+                createTormentGodBow(level),
+                6,
+                m -> m instanceof AbstractSkeleton && !(m instanceof WitherSkeleton)
+            );
+            return;
+        }
         if (tier >= 4 && (wantsFlameBow || wantsPower5Bow) && mob instanceof AbstractSkeleton && !(mob instanceof WitherSkeleton)) {
             scheduleTierItemStomp(
                 mob,
@@ -1069,9 +1244,18 @@ public class SimpleDifficultyScaler
             return;
         }
 
-        // Sword specials (Zombie + Wither Skeleton). Highest-tier wins.
+        // Sword specials (Zombie + Wither Skeleton). Highest-tier wins (Torment god sword > Sharp V netherite > plain netherite > diamond).
         if (!(mob instanceof Zombie) && !(mob instanceof WitherSkeleton)) return;
-        if (wantsSharpNetherite && tier >= 4) {
+        if (wantsTormentGodSword && tier >= 6) {
+            scheduleTierItemStomp(
+                mob,
+                level,
+                10,
+                createTormentGodSword(level),
+                6,
+                m -> (m instanceof Zombie) || (m instanceof WitherSkeleton)
+            );
+        } else if (wantsSharpNetherite && tier >= 4) {
             scheduleTierItemStomp(
                 mob,
                 level,
@@ -1085,6 +1269,184 @@ public class SimpleDifficultyScaler
         } else if (wantsDiamond) {
             scheduleTierSwordStomp(mob, level, 10, Items.DIAMOND_SWORD, 2);
         }
+    }
+
+    /**
+     * Torment (tier 6): one roll per Pillager on first join for Multishot + Quick Charge III crossbow pending tag.
+     * Runs at HIGH so {@link #onEntityJoinLevelTormentPillagerCrossbow} (LOWEST) sees the tag in the same join cycle.
+     */
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public void onEntityJoinLevelTormentPillagerCrossbowRoll(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!(event.getEntity() instanceof Pillager pillager)) return;
+        if (!pillager.isAlive()) return;
+        if (getCurrentTier(level) != Tier.TORMENT.id) return;
+        if (pillager.getPersistentData().getBoolean(TORMENT_PILLAGER_CROSSBOW_ROLL_DONE_TAG)) return;
+
+        pillager.getPersistentData().putBoolean(TORMENT_PILLAGER_CROSSBOW_ROLL_DONE_TAG, true);
+
+        TierTuning tuning = getTuning(level);
+        if (tuning.tormentPillagerMultishotCrossbowChance() <= 0.0f) return;
+        if (pillager.getRandom().nextFloat() >= tuning.tormentPillagerMultishotCrossbowChance()) return;
+
+        pillager.getPersistentData().putBoolean(PENDING_TORMENT_PILLAGER_CROSSBOW_TAG, true);
+    }
+
+    /**
+     * Torment (tier 6): one roll per Stray/Bogged on first join for Strong Harming arrow behavior.
+     */
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public void onEntityJoinLevelTormentStrayBoggedHarmingArrowRoll(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!(event.getEntity() instanceof Mob mob)) return;
+        if (!(mob instanceof Stray) && !(mob instanceof Bogged)) return;
+        if (!mob.isAlive()) return;
+        if (getCurrentTier(level) != Tier.TORMENT.id) return;
+        if (mob.getPersistentData().getBoolean(TORMENT_STRAY_BOGGED_HARMING_ROLL_DONE_TAG)) return;
+
+        mob.getPersistentData().putBoolean(TORMENT_STRAY_BOGGED_HARMING_ROLL_DONE_TAG, true);
+
+        TierTuning tuning = getTuning(level);
+        if (tuning.tormentStrayBoggedHarmingArrowChance() <= 0.0f) return;
+        if (mob.getRandom().nextFloat() >= tuning.tormentStrayBoggedHarmingArrowChance()) return;
+
+        mob.getPersistentData().putBoolean(TORMENT_STRAY_BOGGED_HARMING_ARROWS_TAG, true);
+    }
+
+    /**
+     * Torment (tier 6): every {@link Vindicator} tags pending Johnny + Sharp V axe on first join.
+     * Mirrors {@link MobSpawnEvent.FinalizeSpawn} path when that event does not run before join.
+     */
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public void onEntityJoinLevelTormentVindicatorJohnnyRoll(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!(event.getEntity() instanceof Vindicator vindicator)) return;
+        if (!vindicator.isAlive()) return;
+        if (getCurrentTier(level) != Tier.TORMENT.id) return;
+        if (vindicator.getPersistentData().getBoolean(TORMENT_VINDICATOR_JOHNNY_ROLL_DONE_TAG)) return;
+
+        vindicator.getPersistentData().putBoolean(TORMENT_VINDICATOR_JOHNNY_ROLL_DONE_TAG, true);
+        vindicator.getPersistentData().putBoolean(PENDING_TORMENT_VINDICATOR_JOHNNY_TAG, true);
+    }
+
+    /**
+     * Torment (tier 6): one roll per mob on first join for Totem of Undying offhand.
+     * Runs at HIGH so any LOWEST equipment stomp sees the tag in the same join cycle.
+     */
+    @SubscribeEvent(priority = EventPriority.HIGH)
+    public void onEntityJoinLevelTormentTotemOffhandRoll(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!(event.getEntity() instanceof Mob mob)) return;
+        if (!mob.isAlive()) return;
+        if (getCurrentTier(level) != Tier.TORMENT.id) return;
+        if (mob.getPersistentData().getBoolean(TORMENT_TOTEM_OFFHAND_ROLL_DONE_TAG)) return;
+
+        mob.getPersistentData().putBoolean(TORMENT_TOTEM_OFFHAND_ROLL_DONE_TAG, true);
+
+        TierTuning tuning = getTuning(level);
+        if (tuning.tormentTotemOffhandChance() <= 0.0f) return;
+        if (mob.getRandom().nextFloat() >= tuning.tormentTotemOffhandChance()) return;
+
+        mob.getPersistentData().putBoolean(PENDING_TORMENT_TOTEM_OFFHAND_TAG, true);
+    }
+
+    /**
+     * Torment (tier 6): Pillagers tagged on join get a Multishot + Quick Charge III crossbow (stomp so vanilla raid gear cannot win).
+     */
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public void onEntityJoinLevelTormentPillagerCrossbow(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!(event.getEntity() instanceof Pillager pillager)) return;
+        if (!pillager.getPersistentData().getBoolean(PENDING_TORMENT_PILLAGER_CROSSBOW_TAG)) return;
+        pillager.getPersistentData().remove(PENDING_TORMENT_PILLAGER_CROSSBOW_TAG);
+        if (getCurrentTier(level) != Tier.TORMENT.id) return;
+
+        TierTuning tuning = getTuning(level);
+        if (tuning.tormentPillagerMultishotCrossbowChance() <= 0.0f) return;
+
+        scheduleTierItemStomp(
+            pillager,
+            level,
+            10,
+            createTormentPillagerCrossbow(level),
+            6,
+            m -> m instanceof Pillager
+        );
+    }
+
+    /**
+     * Torment (tier 6): mobs tagged on join get a Totem of Undying in offhand (stomp so late equipment cannot win).
+     */
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public void onEntityJoinLevelTormentTotemOffhand(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!(event.getEntity() instanceof Mob mob)) return;
+        if (!mob.getPersistentData().getBoolean(PENDING_TORMENT_TOTEM_OFFHAND_TAG)) return;
+        mob.getPersistentData().remove(PENDING_TORMENT_TOTEM_OFFHAND_TAG);
+        if (getCurrentTier(level) != Tier.TORMENT.id) return;
+
+        ItemStack totem = new ItemStack(Items.TOTEM_OF_UNDYING);
+        mob.setItemSlot(EquipmentSlot.OFFHAND, totem.copy());
+        scheduleTierOffhandItemStomp(
+            mob,
+            level,
+            10,
+            totem,
+            6,
+            m -> true
+        );
+    }
+
+    /**
+     * Torment (tier 6): Johnny flag + Sharpness V iron axe, with multi-tick stomp so raid/structure gear cannot win.
+     */
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public void onEntityJoinLevelTormentVindicatorJohnny(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!(event.getEntity() instanceof Vindicator vindicator)) return;
+        if (!vindicator.getPersistentData().getBoolean(PENDING_TORMENT_VINDICATOR_JOHNNY_TAG)) return;
+        vindicator.getPersistentData().remove(PENDING_TORMENT_VINDICATOR_JOHNNY_TAG);
+        if (getCurrentTier(level) != Tier.TORMENT.id) return;
+
+        equipJohnnyVindicator(vindicator, level);
+        scheduleTierItemStomp(
+            vindicator,
+            level,
+            10,
+            createJohnnySharpnessVAxe(level),
+            6,
+            m -> m instanceof Vindicator
+        );
+    }
+
+    /**
+     * Torment (tier 6): arrows shot by tagged {@link Stray}/{@link Bogged} use Strong Harming potion contents instead of vanilla tipped behavior.
+     * Vanilla {@link Arrow} applies potion data through a private {@code setPotionContents} method in 1.21, so we invoke it via reflection after {@code getArrow} runs.
+     */
+    @SubscribeEvent(priority = EventPriority.LOWEST)
+    public void onEntityJoinLevelTormentStrayBoggedArrow(EntityJoinLevelEvent event) {
+        if (event.getLevel().isClientSide()) return;
+        if (!(event.getLevel() instanceof ServerLevel level)) return;
+        if (!(event.getEntity() instanceof Arrow arrow)) return;
+        if (!arrow.isAlive()) return;
+
+        Entity owner = arrow.getOwner();
+        if (!(owner instanceof Mob shooter)) return;
+        if (!(shooter instanceof Stray) && !(shooter instanceof Bogged)) return;
+        if (!shooter.getPersistentData().getBoolean(TORMENT_STRAY_BOGGED_HARMING_ARROWS_TAG)) return;
+        if (getCurrentTier(level) != Tier.TORMENT.id) return;
+
+        TierTuning tuning = getTuning(level);
+        if (tuning.tormentStrayBoggedHarmingArrowChance() <= 0.0f) return;
+
+        tryRetipTormentStrayBoggedArrow(arrow, level);
     }
 
     /**
@@ -1123,6 +1485,15 @@ public class SimpleDifficultyScaler
         return stack;
     }
 
+    private static ItemStack createTormentGodSword(ServerLevel level) {
+        ItemStack stack = new ItemStack(Items.NETHERITE_SWORD);
+        var enchantments = level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
+        stack.enchant(enchantments.getOrThrow(Enchantments.SHARPNESS), 5);
+        stack.enchant(enchantments.getOrThrow(Enchantments.FIRE_ASPECT), 2);
+        stack.enchant(enchantments.getOrThrow(Enchantments.KNOCKBACK), 2);
+        return stack;
+    }
+
     private static ItemStack createSpecialSkeletonBow(ServerLevel level, boolean power5, boolean flame) {
         ItemStack stack = new ItemStack(Items.BOW);
         var enchantments = level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
@@ -1133,6 +1504,42 @@ public class SimpleDifficultyScaler
             stack.enchant(enchantments.getOrThrow(Enchantments.FLAME), 1);
         }
         return stack;
+    }
+
+    private static ItemStack createTormentGodBow(ServerLevel level) {
+        ItemStack stack = new ItemStack(Items.BOW);
+        var enchantments = level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
+        stack.enchant(enchantments.getOrThrow(Enchantments.POWER), 5);
+        stack.enchant(enchantments.getOrThrow(Enchantments.PUNCH), 2);
+        stack.enchant(enchantments.getOrThrow(Enchantments.FLAME), 1);
+        return stack;
+    }
+
+    private static ItemStack createTormentPillagerCrossbow(ServerLevel level) {
+        ItemStack stack = new ItemStack(Items.CROSSBOW);
+        var enchantments = level.registryAccess().lookupOrThrow(Registries.ENCHANTMENT);
+        stack.enchant(enchantments.getOrThrow(Enchantments.MULTISHOT), 1);
+        stack.enchant(enchantments.getOrThrow(Enchantments.QUICK_CHARGE), 3);
+        return stack;
+    }
+
+    /**
+     * Replaces arrow potion data with vanilla Strong Harming ({@code minecraft:strong_harming}, Harming II tipped behavior) and refreshes particle color.
+     */
+    private static void tryRetipTormentStrayBoggedArrow(Arrow arrow, ServerLevel level) {
+        try {
+            Holder<Potion> strongHarming = level.registryAccess()
+                .lookupOrThrow(Registries.POTION)
+                .getOrThrow(VANILLA_STRONG_HARMING_POTION);
+            PotionContents contents = new PotionContents(strongHarming);
+            var setPotionContents = Arrow.class.getDeclaredMethod("setPotionContents", PotionContents.class);
+            setPotionContents.setAccessible(true);
+            setPotionContents.invoke(arrow, contents);
+            var updateColor = Arrow.class.getDeclaredMethod("updateColor");
+            updateColor.setAccessible(true);
+            updateColor.invoke(arrow);
+        } catch (Throwable ignored) {
+        }
     }
 
     private static void scheduleTierItemStomp(
@@ -1149,6 +1556,22 @@ public class SimpleDifficultyScaler
         mob.setItemSlot(EquipmentSlot.MAINHAND, stack.copy());
         if (ticksRemaining <= 1) return;
         level.getServer().execute(() -> scheduleTierItemStomp(mob, level, ticksRemaining - 1, stack, requiredTier, allowedMob));
+    }
+
+    private static void scheduleTierOffhandItemStomp(
+        Mob mob,
+        ServerLevel level,
+        int ticksRemaining,
+        ItemStack stack,
+        int requiredTier,
+        Predicate<Mob> allowedMob
+    ) {
+        if (ticksRemaining <= 0 || !mob.isAlive()) return;
+        if (!(mob.level() instanceof ServerLevel mobLevel) || getCurrentTier(mobLevel) < requiredTier) return;
+        if (allowedMob != null && !allowedMob.test(mob)) return;
+        mob.setItemSlot(EquipmentSlot.OFFHAND, stack.copy());
+        if (ticksRemaining <= 1) return;
+        level.getServer().execute(() -> scheduleTierOffhandItemStomp(mob, level, ticksRemaining - 1, stack, requiredTier, allowedMob));
     }
 
     /**
@@ -1218,9 +1641,9 @@ public class SimpleDifficultyScaler
         if (!(mob instanceof Monster)) return;
 
         int tier = getCurrentTier(level);
-        // Visible effects only: Monsoon amp 0–1, Nightmare+ amp 0–2, Hell (tier 4) amp 0–3. Inferno/Torment match Nightmare cap.
-        // (Hidden effects below remain amp 0 only.)
-        int visibleAmpMaxInclusive = tier == 4 ? 3 : (tier >= 3 ? 2 : 1);
+        // Visible effects only: Monsoon amp 0–1, Nightmare+ amp 0–2, Hell (tier 4) amp 0–3, Torment (tier 6) amp 0–4.
+            // (Hidden effects below remain amp 0 only.)
+        int visibleAmpMaxInclusive = tier == Tier.TORMENT.id ? 4 : (tier == Tier.HELL.id ? 3 : (tier >= 3 ? 2 : 1));
 
         float pv = tuning.potionVisibleChance();
         if (random.nextFloat() < pv) {
@@ -1294,6 +1717,39 @@ public class SimpleDifficultyScaler
             Items.DIAMOND_SHOVEL,
             Items.IRON_SHOVEL, Items.STONE_SHOVEL, Items.WOODEN_SHOVEL
         );
+    }
+
+    private static Item pickTormentDiamondNetheriteMeleeWeapon(RandomSource random) {
+        return pick(
+            random,
+            Items.DIAMOND_SWORD, Items.NETHERITE_SWORD,
+            Items.DIAMOND_AXE, Items.NETHERITE_AXE,
+            Items.DIAMOND_SHOVEL, Items.NETHERITE_SHOVEL,
+            Items.DIAMOND_PICKAXE, Items.NETHERITE_PICKAXE,
+            Items.DIAMOND_HOE, Items.NETHERITE_HOE
+        );
+    }
+
+    private static boolean isTormentRangedOrSpecialMainHand(ItemStack main) {
+        // Bow / crossbow / trident: keep vanilla ranged role. Mace: unique weapon; do not swap for sword/axe.
+        return main.is(Items.BOW) || main.is(Items.CROSSBOW) || main.is(Items.TRIDENT) || main.is(Items.MACE);
+    }
+
+    /**
+     * True when this mob type gets mod melee weapon rolls and the main hand should become diamond–netherite in Torment:
+     * empty hand, or a {@link TieredItem} tool/sword below diamond tier.
+     */
+    private static boolean shouldTormentReplaceOrFillMainWeapon(Mob mob, ItemStack main) {
+        if (!isVanillaGearRollingMob(mob)) return false;
+        if (isTormentRangedOrSpecialMainHand(main)) return false;
+        if (main.isEmpty()) return true;
+        Item item = main.getItem();
+        if (item instanceof TieredItem tiered) {
+            // 1.21+: Tier has no ordering; vanilla tools use {@link Tiers} singletons.
+            var material = tiered.getTier();
+            return material != Tiers.DIAMOND && material != Tiers.NETHERITE;
+        }
+        return false;
     }
 
     private static boolean isVanillaGearRollingMob(Mob mob) {
